@@ -1,0 +1,8 @@
+ultralytics==8.4.14
+opencv-python==4.13.0.92
+torch==2.7.0
+torchvision==0.22.0
+matplotlib==3.10.5
+tqdm==4.67.3
+requests==2.32.5
+PyYAML==6.0.3
