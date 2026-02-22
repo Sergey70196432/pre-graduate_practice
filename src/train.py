@@ -4,7 +4,7 @@ train.py
 
 Назначение
 ----------
-Этот скрипт обучает YOLOv8 (Ultralytics) на подготовленном датасете GTSDB
+Этот скрипт обучает YOLOv8 (Ultralytics) на подготовленном датасете RTSD
 в формате YOLO (см. `data/yolo/dataset.yaml`).
 
 Что делает скрипт:
@@ -25,8 +25,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import torch
-from ultralytics import YOLO
+try:
+    import torch
+    from ultralytics import YOLO
+except ModuleNotFoundError as e:
+    print(
+        "[ОШИБКА] Не найдена зависимость: "
+        f"{e}.\n"
+        "Установите зависимости проекта командой:\n"
+        "  pip install -r requirements.txt\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 # ----------------------------
 # Настройки (меняйте при необходимости)
@@ -128,8 +138,62 @@ def try_extract_map50_from_results_csv(run_dir: Path) -> float | None:
         return None
 
 
+def get_ultralytics_save_dir(train_result: Any, fallback_run_dir: Path) -> Path:
+    """
+    Пытается определить реальную папку, куда Ultralytics сохранил эксперимент.
+
+    Почему это важно:
+    - Ultralytics может автоматически переименовать `name` (например, experiment1 -> experiment15),
+      если такая папка уже существует;
+    - иногда путь оказывается не `models/experiment1`, а, например, `runs/detect/models/experiment15`.
+
+    Поэтому нельзя жёстко полагаться только на `PROJECT_DIR / EXPERIMENT_NAME`.
+    """
+    # 1) Самый надёжный вариант — train_result.save_dir (есть во многих версиях Ultralytics)
+    if hasattr(train_result, "save_dir"):
+        sd = getattr(train_result, "save_dir")
+        if sd:
+            try:
+                p = Path(sd)
+                if p.exists():
+                    return p
+            except Exception:
+                pass
+
+    # 2) Иногда путь лежит в model.trainer.save_dir, но сюда мы его напрямую не передаём.
+    # Поэтому оставим только fallback.
+    return fallback_run_dir
+
+
+def find_best_checkpoint(save_dir: Path) -> Path | None:
+    """
+    Ищет `weights/best.pt`:
+    - сначала в `save_dir/weights/best.pt`;
+    - затем (fallback) ищет самый свежий `**/weights/best.pt` в `save_dir` и в `runs/`.
+    """
+    direct = save_dir / "weights" / "best.pt"
+    if direct.exists():
+        return direct
+
+    # Иногда Ultralytics мог сохранить не совсем туда, куда ожидаем.
+    # Для robustness попробуем найти самый свежий best.pt.
+    candidates: list[Path] = []
+    if save_dir.exists():
+        candidates.extend(save_dir.rglob("weights/best.pt"))
+
+    runs_dir = Path("runs")
+    if runs_dir.exists():
+        candidates.extend(runs_dir.rglob("weights/best.pt"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def main() -> None:
-    print("[INFO] === YOLOv8: обучение на GTSDB ===")
+    print("[INFO] === YOLOv8: обучение на RTSD ===")
 
     # Проверяем, что датасет подготовлен
     if not DATASET_YAML.exists():
@@ -163,13 +227,18 @@ def main() -> None:
     )
     print("[INFO] Обучение завершено.")
 
-    run_dir = PROJECT_DIR / EXPERIMENT_NAME
-    best_path = run_dir / "weights" / "best.pt"
+    # Важно: Ultralytics может сохранить результаты не ровно в `models/experiment1`.
+    # Получим реальный save_dir (или используем fallback) и уже относительно него найдём best.pt.
+    fallback_run_dir = PROJECT_DIR / EXPERIMENT_NAME
+    save_dir = get_ultralytics_save_dir(train_result, fallback_run_dir=fallback_run_dir)
+    print(f"[INFO] Папка эксперимента (save_dir): {save_dir}")
 
-    if not best_path.exists():
+    best_path = find_best_checkpoint(save_dir)
+
+    if best_path is None or not best_path.exists():
         _die(
-            f"Не найден файл лучшей модели `{best_path}`.\n"
-            "Возможно, обучение не завершилось корректно. Проверьте логи в папке models/."
+            "Не найден файл лучшей модели `best.pt`.\n"
+            "Проверьте, куда Ultralytics сохранил эксперимент (обычно `runs/` или `models/`)."
         )
 
     # Копируем best.pt в models/model.pt — удобно для отчёта/демо
@@ -197,12 +266,12 @@ def main() -> None:
             map50_float = None
 
     if map50_float is None:
-        map50_float = try_extract_map50_from_results_csv(run_dir)
+        map50_float = try_extract_map50_from_results_csv(save_dir)
 
     # Пишем model_info.txt (полезно для отчёта)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     info_lines = [
-        "YOLOv8 training summary (GTSDB)",
+        "YOLOv8 training summary (RTSD)",
         f"datetime: {now}",
         f"dataset_yaml: {DATASET_YAML.as_posix()}",
         f"pretrained: {MODEL_PRETRAINED}",
@@ -214,6 +283,7 @@ def main() -> None:
         f"augment: {AUGMENT}",
         f"project_dir: {PROJECT_DIR.as_posix()}",
         f"experiment_name: {EXPERIMENT_NAME}",
+        f"save_dir: {save_dir.as_posix()}",
         f"best_checkpoint: {best_path.as_posix()}",
         f"final_model: {FINAL_MODEL_PATH.as_posix()}",
         f"python: {sys.version.split()[0]}",
@@ -249,7 +319,7 @@ def main() -> None:
         _die(f"Не удалось записать `{MODEL_INFO_PATH}`: {e}")
 
     print(f"[INFO] Информация о модели сохранена: {MODEL_INFO_PATH}")
-    print(f"[INFO] Графики/логи эксперимента лежат в: {run_dir}")
+    print(f"[INFO] Графики/логи эксперимента лежат в: {save_dir}")
 
 
 if __name__ == "__main__":
