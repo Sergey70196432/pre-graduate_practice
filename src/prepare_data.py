@@ -27,7 +27,7 @@ prepare_data.py
 CSV-формат (допущение)
 ----------------------
 Ожидаем поля:
-  filename, x1, y1, x2, y2, class_name
+  filename, x_from, y_from, width, height, sign_class
 Разделитель обычно "," (иногда ";"), первая строка может быть заголовком.
 Если реальный формат отличается, смотрите функции `_parse_csv_header/_parse_row`.
 
@@ -104,6 +104,20 @@ class RtBox:
     x2: int
     y2: int
     class_name: str
+
+
+@dataclass(frozen=True)
+class CsvSchema:
+    """
+    Описание схемы CSV.
+
+    mode:
+      - "xywh": есть колонки x/y/width/height
+      - "xyxy": есть колонки x1/y1/x2/y2
+    """
+
+    mode: str
+    idx: dict[str, int]
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -193,10 +207,13 @@ def _sniff_csv_dialect(csv_path: Path) -> csv.Dialect:
 
 def _looks_like_header_row(row: list[str]) -> bool:
     joined = " ".join(c.strip().lower() for c in row if c is not None)
-    return "filename" in joined and ("x1" in joined or "x_min" in joined or "xmin" in joined)
+    return "filename" in joined and (
+        ("x1" in joined or "x_min" in joined or "xmin" in joined)
+        or ("x_from" in joined or "y_from" in joined or "width" in joined or "height" in joined)
+    )
 
 
-def _parse_csv_header(header: list[str]) -> dict[str, int]:
+def _parse_csv_header(header: list[str]) -> CsvSchema:
     """
     Если CSV содержит заголовок — пытаемся сопоставить имена колонок с индексами.
     Поддерживаем несколько вариантов названий (на случай отличий в исходнике).
@@ -209,60 +226,96 @@ def _parse_csv_header(header: list[str]) -> dict[str, int]:
                 return norm.index(c)
         return None
 
-    idx = {
-        "filename": _find("filename", "file", "image", "img", "name"),
-        "x1": _find("x1", "xmin", "x_min", "left"),
-        "y1": _find("y1", "ymin", "y_min", "top"),
-        "x2": _find("x2", "xmax", "x_max", "right"),
-        "y2": _find("y2", "ymax", "y_max", "bottom"),
-        "class": _find("class_name", "class", "label", "class_id"),
-    }
+    # В RTSD (как в нашем примере) встречается формат:
+    # filename,x_from,y_from,width,height,sign_class
+    x = _find("x_from", "x", "xmin", "x_min", "left")
+    y = _find("y_from", "y", "ymin", "y_min", "top")
+    w = _find("width", "w")
+    h = _find("height", "h")
 
-    if any(v is None for v in idx.values()):
-        # Если заголовок есть, но мы не смогли распознать — лучше явно предупредить.
-        missing = [k for k, v in idx.items() if v is None]
+    # Альтернативный формат (если встретится): x1,y1,x2,y2
+    x1 = _find("x1", "xmin", "x_min", "left")
+    y1 = _find("y1", "ymin", "y_min", "top")
+    x2 = _find("x2", "xmax", "x_max", "right")
+    y2 = _find("y2", "ymax", "y_max", "bottom")
+
+    filename = _find("filename", "file", "image", "img", "name")
+    cls = _find("sign_class", "class_name", "class", "label", "class_id")
+
+    if filename is None or cls is None:
         _die(
-            "Не удалось распознать колонки CSV по заголовку.\n"
-            f"Файл: {header}\n"
-            f"Не найдены колонки: {missing}\n"
+            "Не удалось распознать обязательные колонки CSV (filename / class).\n"
+            f"header={header}\n"
             "Проверьте формат CSV и при необходимости поправьте `_parse_csv_header()`."
         )
 
-    return {k: int(v) for k, v in idx.items() if v is not None}
+    if x is not None and y is not None and w is not None and h is not None:
+        return CsvSchema(
+            mode="xywh",
+            idx={"filename": int(filename), "x": int(x), "y": int(y), "w": int(w), "h": int(h), "class": int(cls)},
+        )
+
+    if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+        return CsvSchema(
+            mode="xyxy",
+            idx={"filename": int(filename), "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2), "class": int(cls)},
+        )
+
+    _die(
+        "Не удалось распознать координаты bbox в CSV.\n"
+        f"header={header}\n"
+        "Ожидался формат либо (x_from,y_from,width,height), либо (x1,y1,x2,y2)."
+    )
 
 
-def _parse_row(row: list[str], col_idx: dict[str, int] | None) -> RtBox | None:
+def _parse_row(row: list[str], schema: CsvSchema | None) -> RtBox | None:
     """
     Преобразует строку CSV в RtBox.
 
     Допущение:
     - Если нет заголовка, ожидаем 6 полей:
-      filename, x1, y1, x2, y2, class_name
+      filename, x_from, y_from, width, height, sign_class
     """
     try:
-        if col_idx is None:
+        if schema is None:
             if len(row) < 6:
                 return None
             filename = row[0].strip()
-            x1, y1, x2, y2 = row[1:5]
+            x, y, w, h = row[1:5]
             class_name = row[5].strip()
+
+            x1 = int(float(x))
+            y1 = int(float(y))
+            ww = int(float(w))
+            hh = int(float(h))
+            x2 = x1 + ww
+            y2 = y1 + hh
         else:
-            filename = row[col_idx["filename"]].strip()
-            x1 = row[col_idx["x1"]]
-            y1 = row[col_idx["y1"]]
-            x2 = row[col_idx["x2"]]
-            y2 = row[col_idx["y2"]]
-            class_name = row[col_idx["class"]].strip()
+            filename = row[schema.idx["filename"]].strip()
+            class_name = row[schema.idx["class"]].strip()
+
+            if schema.mode == "xywh":
+                x1 = int(float(row[schema.idx["x"]]))
+                y1 = int(float(row[schema.idx["y"]]))
+                ww = int(float(row[schema.idx["w"]]))
+                hh = int(float(row[schema.idx["h"]]))
+                x2 = x1 + ww
+                y2 = y1 + hh
+            else:
+                x1 = int(float(row[schema.idx["x1"]]))
+                y1 = int(float(row[schema.idx["y1"]]))
+                x2 = int(float(row[schema.idx["x2"]]))
+                y2 = int(float(row[schema.idx["y2"]]))
 
         if not filename or not class_name:
             return None
 
         return RtBox(
             filename=filename,
-            x1=int(float(x1)),
-            y1=int(float(y1)),
-            x2=int(float(x2)),
-            y2=int(float(y2)),
+            x1=int(x1),
+            y1=int(y1),
+            x2=int(x2),
+            y2=int(y2),
             class_name=class_name,
         )
     except (ValueError, IndexError):
@@ -288,18 +341,18 @@ def iter_boxes_from_csv(csv_path: Path) -> Iterable[RtBox]:
             except StopIteration:
                 return
 
-            col_idx: dict[str, int] | None = None
+            schema: CsvSchema | None = None
             if first_row is not None and _looks_like_header_row(first_row):
-                col_idx = _parse_csv_header(first_row)
+                schema = _parse_csv_header(first_row)
             else:
-                box = _parse_row(first_row, col_idx=None)
+                box = _parse_row(first_row, schema=None)
                 if box is not None:
                     yield box
 
             for row in reader:
                 if not row:
                     continue
-                box = _parse_row(row, col_idx=col_idx)
+                box = _parse_row(row, schema=schema)
                 if box is None:
                     continue
                 yield box
