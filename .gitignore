@@ -218,3 +218,9 @@ models/*
 runs/
 
 yolov8n.pt
+
+.python-version
+
+logs
+
+.DS_Store
