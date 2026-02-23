@@ -134,6 +134,21 @@ class VideoProcessor:
             self.frame_count = 0
             self._put("status", f"FPS: {self.fps:.2f}. Начинаем обработку кадров...")
 
+            # ------------------------------------------------------------
+            # Ограничение скорости воспроизведения (real-time playback)
+            # ------------------------------------------------------------
+            # На мощной видеокарте детекция может идти быстрее номинального FPS файла.
+            # Тогда "видео" в GUI выглядит ускоренным, потому что мы выдаём кадры быстрее реального времени.
+            #
+            # Решение: синхронизируем выдачу кадров по времени видео:
+            #   target_wall_time = base_wall + (video_time - base_video_time)
+            #
+            # base_* сбрасываем при перемотке и корректируем при паузе.
+            base_wall = time.monotonic()
+            base_video_time = 0.0
+            last_paused = False
+            paused_started_at: float | None = None
+
             # Основной цикл чтения кадров.
             while self.running:
                 # 1) Считываем команды управления от GUI (seek / pause).
@@ -159,6 +174,10 @@ class VideoProcessor:
                     self.frame_count = target_frame
                     self._put("status", f"Перемотка: {_sec_to_mmss(seek_time)}")
 
+                    # Сбрасываем синхронизацию воспроизведения после перемотки.
+                    base_wall = time.monotonic()
+                    base_video_time = self.frame_count / self.fps
+
                     # Если мы на паузе — покажем кадр после перемотки сразу (без детекции),
                     # чтобы пользователь видел результат перемотки.
                     if paused:
@@ -168,6 +187,16 @@ class VideoProcessor:
                             t_preview = self.frame_count / self.fps
                             self._put("frame", (preview, [], self.frame_count, t_preview))
                             self._put("progress", {"time_sec": t_preview, "frame_index": self.frame_count})
+
+                # Обработка переходов пауза/продолжить для корректной синхронизации времени.
+                if paused and not last_paused:
+                    paused_started_at = time.monotonic()
+                if (not paused) and last_paused and paused_started_at is not None:
+                    # Сдвигаем базовую "стеночную" точку на длительность паузы,
+                    # чтобы после продолжения не было скачка скорости.
+                    base_wall += time.monotonic() - paused_started_at
+                    paused_started_at = None
+                last_paused = paused
 
                 # 2) Если пауза включена — не читаем кадры, но остаёмся “живыми”.
                 if paused:
@@ -239,6 +268,18 @@ class VideoProcessor:
                 # Обновление прогресса для трек-бара (не слишком часто).
                 if self.frame_count % 5 == 0:
                     self._put("progress", {"time_sec": current_time, "frame_index": self.frame_count})
+
+                # Синхронизация по времени видео (если обрабатываем быстрее, чем FPS).
+                target_wall = base_wall + (current_time - base_video_time)
+                # Спим маленькими порциями, чтобы быстрее реагировать на Stop/Pause/Seek.
+                while self.running:
+                    with self._lock:
+                        if self._paused:
+                            break
+                    sleep_s = target_wall - time.monotonic()
+                    if sleep_s <= 0:
+                        break
+                    time.sleep(min(0.05, sleep_s))
 
             # Если вышли из цикла — значит видео закончилось или мы остановили обработку.
             if self.running:
