@@ -675,7 +675,7 @@ class App:
 
             # Текст (класс + уверенность).
             conf_percent = float(conf) * 100.0
-            text = f"{label} {conf_percent}%"
+            text = f"{label} {conf_percent:.2f}%"
 
             # Подпись рисуем чуть выше верхней границы bbox.
             text_pos = (p1[0], max(0, p1[1] - 10))
