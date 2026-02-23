@@ -76,6 +76,11 @@ TEST_FILENAMES_PATH = GT_DIR / "test_filenames.txt"
 # Если по факту окажется меньше/больше, скрипт НЕ упадёт, но выведет предупреждение.
 EXPECTED_NC = 106
 
+# RTSD имеет сильный дисбаланс классов.
+# Чтобы упростить обучение/эксперименты, можем удалить "редкие" классы.
+# Примеров считаем по числу bbox-аннотаций (строк CSV) на класс.
+MIN_CLASS_EXAMPLES = 20
+
 # Сколько знаков после запятой писать в координатах YOLO
 YOLO_FLOAT_PRECISION = 6
 
@@ -456,29 +461,60 @@ def main() -> None:
     if not csv_paths:
         _die(f"В `{GT_DIR}` не найдено файлов `*/train_gt.csv` / `*/test_gt.csv`.")
 
-    # Первый проход: собираем уникальные class_name
-    all_class_names: set[str] = set()
-    total_rows = 0
+    # Первый проход: собираем статистику по классам
+    # Важно: "пример" считаем по bbox (строка CSV).
+    class_counts: dict[str, int] = {}
+    total_boxes = 0
     bad_rows = 0
     for csv_path in csv_paths:
         for box in iter_boxes_from_csv(csv_path):
-            total_rows += 1
             if not box.class_name:
                 bad_rows += 1
                 continue
-            all_class_names.add(box.class_name)
+            total_boxes += 1
+            class_counts[box.class_name] = class_counts.get(box.class_name, 0) + 1
 
-    if not all_class_names:
+    if not class_counts:
         _die("Не удалось собрать ни одного имени класса из CSV. Проверьте формат исходных данных.")
 
-    class_names_sorted = sorted(all_class_names)
+    # Сколько уникальных классов вообще есть в исходной разметке (до фильтрации)
+    original_unique_classes = len(class_counts)
+    if original_unique_classes != EXPECTED_NC:
+        print(
+            f"[WARN] В исходной разметке ожидалось классов: {EXPECTED_NC}, "
+            f"но найдено: {original_unique_classes}.\n"
+            "       Это может быть нормально, если архив неполный/другой сплит, "
+            "но лучше перепроверьте исходные файлы."
+        )
+
+    # Удаляем редкие классы (по порогу MIN_CLASS_EXAMPLES)
+    kept_class_names = sorted([k for k, v in class_counts.items() if v >= MIN_CLASS_EXAMPLES])
+    dropped_class_names = sorted([k for k, v in class_counts.items() if v < MIN_CLASS_EXAMPLES])
+
+    if dropped_class_names:
+        print(
+            "[INFO] Фильтрация редких классов включена.\n"
+            f"       MIN_CLASS_EXAMPLES={MIN_CLASS_EXAMPLES}\n"
+            f"       удалено классов: {len(dropped_class_names)}, оставлено: {len(kept_class_names)}"
+        )
+    else:
+        print(
+            "[INFO] Фильтрация редких классов: ничего не удалено "
+            f"(MIN_CLASS_EXAMPLES={MIN_CLASS_EXAMPLES})."
+        )
+
+    if not kept_class_names:
+        _die(
+            "После фильтрации редких классов не осталось ни одного класса.\n"
+            f"Уменьшите MIN_CLASS_EXAMPLES (сейчас {MIN_CLASS_EXAMPLES})."
+        )
+
+    # Итоговое отображение: class_name -> class_id (0..N-1)
+    class_names_sorted = kept_class_names
     class_to_id = {name: i for i, name in enumerate(class_names_sorted)}
 
-    if len(class_names_sorted) != EXPECTED_NC:
-        print(
-            f"[WARN] Ожидалось классов: {EXPECTED_NC}, найдено: {len(class_names_sorted)}.\n"
-            "       Скрипт продолжит работу, но проверьте корректность разметки/файлов."
-        )
+    # Важно: после фильтрации число классов будет меньше EXPECTED_NC — это нормально.
+    print(f"[INFO] Итоговое число классов после фильтрации: {len(class_names_sorted)}")
 
     # Сохраняем classes.txt (по одному имени класса на строку)
     classes_txt_path = YOLO_DIR / "classes.txt"
@@ -494,6 +530,14 @@ def main() -> None:
     yolo_lines_by_file: dict[str, list[str]] = {}
     skipped_boxes = 0
     missing_images = 0
+
+    # Важно: чтобы не остались старые label-файлы от предыдущих запусков
+    # (например, когда меняем фильтрацию классов), очищаем labels/.
+    try:
+        for p in LABELS_DIR.glob("*.txt"):
+            p.unlink()
+    except OSError as e:
+        _die(f"Не удалось очистить папку `{LABELS_DIR}`: {e}")
 
     def _get_image_size(filename: str) -> tuple[int, int] | None:
         if filename in image_size_cache:
@@ -514,6 +558,7 @@ def main() -> None:
         for box in iter_boxes_from_csv(csv_path):
             class_id = class_to_id.get(box.class_name)
             if class_id is None:
+                # Этот класс был удалён фильтрацией (или не распознан).
                 skipped_boxes += 1
                 continue
 
