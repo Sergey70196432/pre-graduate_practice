@@ -48,7 +48,7 @@ MODEL_PRETRAINED = "yolov8n.pt"  # скачивается автоматичес
 
 EPOCHS = 50
 BATCH = 16
-IMGSZ = 640
+IMGSZ = 800
 OPTIMIZER = "AdamW"
 LR0 = 0.001
 AUGMENT = True
