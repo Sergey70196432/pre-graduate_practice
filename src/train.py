@@ -52,6 +52,11 @@ IMGSZ = 800
 OPTIMIZER = "AdamW"
 LR0 = 0.001
 AUGMENT = True
+COS_LR = True
+CLS = 1.5
+MIXUP = 0.2
+DEGREES=5.0
+SCALE = 0.5
 
 PROJECT_DIR = Path("models")
 EXPERIMENT_NAME = "experiment1"
@@ -223,6 +228,11 @@ def main() -> None:
         name=EXPERIMENT_NAME,
         save=True,
         plots=True,
+        cls=CLS,
+        cos_lr=COS_LR,
+        mixup=MIXUP,
+        degrees=DEGREES,
+        scale=SCALE,
         device="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
     )
     print("[INFO] Обучение завершено.")
